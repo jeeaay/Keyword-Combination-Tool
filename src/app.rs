@@ -36,6 +36,7 @@ pub struct EditorPaneState {
 pub struct ActionPanelState {
     pub generate_enabled: bool,
     pub copy_enabled: bool,
+    pub insert_spaces: bool,
     pub primary_label: &'static str,
     pub secondary_label: &'static str,
     pub status_message: String,
@@ -62,8 +63,22 @@ pub enum FeedbackTone {
 struct RememberedEntriesState {
     prefixes: Vec<String>,
     suffixes: Vec<String>,
+    insert_spaces: bool,
     storage_path: Option<PathBuf>,
     storage_status: String,
+}
+
+/// `EditorInteraction` 描述输入卡片本帧触发的主要交互，便于父层决定是否更新记忆。
+enum EditorInteraction {
+    None,
+    ReusedMemory,
+    RemoveMemory,
+}
+
+/// `MemoryBucket` 区分前缀与后缀两类本地记忆，用于统一删除与反馈逻辑。
+enum MemoryBucket {
+    Prefix,
+    Suffix,
 }
 
 /// `PersistedMemory` 描述写入本地 JSON 文件的前后缀持久化模型。
@@ -71,18 +86,23 @@ struct RememberedEntriesState {
 struct PersistedMemory {
     prefixes: Vec<String>,
     suffixes: Vec<String>,
+    #[serde(default)]
+    insert_spaces: bool,
 }
 
 impl KeywordApp {
     /// 创建应用初始状态，注入统一主题并在启动时恢复已保存的前后缀记忆。
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply_theme(&cc.egui_ctx);
+        let memory = Self::load_remembered_entries();
+        let mut actions = ActionPanelState::new();
+        actions.insert_spaces = memory.insert_spaces;
 
         Self {
             input: InputState::new(),
-            actions: ActionPanelState::new(),
+            actions,
             results: ResultPanelState::new(),
-            memory: Self::load_remembered_entries(),
+            memory,
         }
     }
 
@@ -104,32 +124,41 @@ impl KeywordApp {
                     Layout::top_down(Align::Min),
                     |ui| {
                         ui.columns(3, |columns| {
-                            if Self::render_editor_with_memory(
+                            match Self::render_editor_with_memory(
                                 &mut columns[0],
                                 &mut self.input.prefix,
                                 Some(&prefix_memory),
                             ) {
-                                self.results.set_info_feedback(
+                                EditorInteraction::ReusedMemory => self.results.set_info_feedback(
                                     "已将记忆前缀回填到输入区；重复条目会自动忽略。",
-                                );
+                                ),
+                                EditorInteraction::RemoveMemory => {
+                                    self.clear_remembered_entries(MemoryBucket::Prefix);
+                                }
+                                EditorInteraction::None => {}
                             }
-                            if Self::render_editor_with_memory(
+                            match Self::render_editor_with_memory(
                                 &mut columns[1],
                                 &mut self.input.keyword,
                                 None,
                             ) {
-                                self.results.set_info_feedback(
+                                EditorInteraction::ReusedMemory => self.results.set_info_feedback(
                                     "核心词输入区已更新，可直接生成新的组合结果。",
-                                );
+                                ),
+                                EditorInteraction::RemoveMemory | EditorInteraction::None => {}
                             }
-                            if Self::render_editor_with_memory(
+                            match Self::render_editor_with_memory(
                                 &mut columns[2],
                                 &mut self.input.suffix,
                                 Some(&suffix_memory),
                             ) {
-                                self.results.set_info_feedback(
+                                EditorInteraction::ReusedMemory => self.results.set_info_feedback(
                                     "已将记忆后缀回填到输入区；重复条目会自动忽略。",
-                                );
+                                ),
+                                EditorInteraction::RemoveMemory => {
+                                    self.clear_remembered_entries(MemoryBucket::Suffix);
+                                }
+                                EditorInteraction::None => {}
                             }
                         });
                     },
@@ -201,14 +230,21 @@ impl KeywordApp {
             return;
         }
 
-        let combinations = Self::build_combinations(&prefixes, &keywords, &suffixes);
+        let combinations =
+            Self::build_combinations(&prefixes, &keywords, &suffixes, self.actions.insert_spaces);
         let persistence_feedback = self.persist_generated_memory(&prefixes, &suffixes);
 
         self.results.total_count = combinations.len();
         self.results.preview_text = combinations.join("\n");
         self.results.set_success_feedback(format!(
-            "生成完成：共 {} 条结果，均按“前缀 + 核心词 + 后缀”顺序拼接。{}",
-            self.results.total_count, persistence_feedback
+            "生成完成：共 {} 条结果，均按“前缀 + 核心词 + 后缀”顺序拼接。{}{}",
+            self.results.total_count,
+            if self.actions.insert_spaces {
+                "已按非空片段自动插入空格。"
+            } else {
+                ""
+            },
+            persistence_feedback
         ));
         self.actions.status_message = format!(
             "生成成功：{} 条结果已写入右侧预览区。",
@@ -250,6 +286,7 @@ impl KeywordApp {
                 return RememberedEntriesState {
                     prefixes: Vec::new(),
                     suffixes: Vec::new(),
+                    insert_spaces: false,
                     storage_path: None,
                     storage_status: format!("本地记忆不可用：{err}"),
                 };
@@ -260,9 +297,10 @@ impl KeywordApp {
             return RememberedEntriesState {
                 prefixes: Vec::new(),
                 suffixes: Vec::new(),
+                insert_spaces: false,
                 storage_path: Some(storage_path.clone()),
                 storage_status: format!(
-                    "本地记忆文件尚未创建；首次生成非空前后缀后会保存到 {}。",
+                    "本地记忆文件尚未创建；首次生成或调整偏好后会保存到 {}。",
                     storage_path.display()
                 ),
             };
@@ -276,19 +314,22 @@ impl KeywordApp {
 
                     RememberedEntriesState {
                         storage_status: format!(
-                            "已从 {} 恢复 {} 个前缀和 {} 个后缀。",
+                            "已从 {} 恢复 {} 个前缀、{} 个后缀；添加空格为 {}。",
                             storage_path.display(),
                             prefixes.len(),
-                            suffixes.len()
+                            suffixes.len(),
+                            if memory.insert_spaces { "开启" } else { "关闭" }
                         ),
                         prefixes,
                         suffixes,
+                        insert_spaces: memory.insert_spaces,
                         storage_path: Some(storage_path),
                     }
                 }
                 Err(err) => RememberedEntriesState {
                     prefixes: Vec::new(),
                     suffixes: Vec::new(),
+                    insert_spaces: false,
                     storage_path: Some(storage_path.clone()),
                     storage_status: format!(
                         "读取本地记忆失败：{}，错误：{}。",
@@ -300,6 +341,7 @@ impl KeywordApp {
             Err(err) => RememberedEntriesState {
                 prefixes: Vec::new(),
                 suffixes: Vec::new(),
+                insert_spaces: false,
                 storage_path: Some(storage_path.clone()),
                 storage_status: format!(
                     "打开本地记忆失败：{}，错误：{}。",
@@ -312,35 +354,20 @@ impl KeywordApp {
 
     /// 在生成成功后合并并保存新的前后缀记忆，同时返回界面反馈文案。
     fn persist_generated_memory(&mut self, prefixes: &[String], suffixes: &[String]) -> String {
-        if prefixes.is_empty() && suffixes.is_empty() {
-            return "本次未提供非空前后缀，因此未更新本地记忆。".to_owned();
-        }
-
-        let mut persisted = PersistedMemory {
-            prefixes: self.memory.prefixes.clone(),
-            suffixes: self.memory.suffixes.clone(),
-        };
+        let mut persisted = self.snapshot_persisted_memory();
 
         let added_prefixes = Self::merge_unique_entries(&mut persisted.prefixes, prefixes);
         let added_suffixes = Self::merge_unique_entries(&mut persisted.suffixes, suffixes);
 
-        match Self::write_persisted_memory(&persisted) {
-            Ok(path) => {
-                self.memory.prefixes = persisted.prefixes;
-                self.memory.suffixes = persisted.suffixes;
-                self.memory.storage_path = Some(path.clone());
-                self.memory.storage_status = format!(
-                    "本地记忆已更新：{} 个前缀、{} 个后缀，文件位于 {}。",
-                    self.memory.prefixes.len(),
-                    self.memory.suffixes.len(),
-                    path.display()
-                );
-
-                if added_prefixes == 0 && added_suffixes == 0 {
-                    "本次前后缀均已存在于本地记忆中。".to_owned()
+        match self.store_persisted_memory(persisted) {
+            Ok(_) => {
+                if prefixes.is_empty() && suffixes.is_empty() {
+                    "本次未提供非空前后缀；已同步保存“添加空格”设置。".to_owned()
+                } else if added_prefixes == 0 && added_suffixes == 0 {
+                    "本次前后缀均已存在于本地记忆中；“添加空格”设置也已同步保存。".to_owned()
                 } else {
                     format!(
-                        "已保存 {} 个新增前缀和 {} 个新增后缀到本地记忆。",
+                        "已保存 {} 个新增前缀和 {} 个新增后缀到本地记忆，并同步保存“添加空格”设置。",
                         added_prefixes, added_suffixes
                     )
                 }
@@ -387,6 +414,32 @@ impl KeywordApp {
             .map_err(|err| format!("无法写入本地记忆文件 {}：{err}", storage_path.display()))?;
 
         Ok(storage_path)
+    }
+
+    /// 基于当前内存状态创建一份完整的持久化快照，包含前后缀与“添加空格”偏好。
+    fn snapshot_persisted_memory(&self) -> PersistedMemory {
+        PersistedMemory {
+            prefixes: self.memory.prefixes.clone(),
+            suffixes: self.memory.suffixes.clone(),
+            insert_spaces: self.actions.insert_spaces,
+        }
+    }
+
+    /// 将完整持久化快照写入磁盘，并同步刷新内存中的记忆与偏好状态。
+    fn store_persisted_memory(&mut self, persisted: PersistedMemory) -> Result<PathBuf, String> {
+        let path = Self::write_persisted_memory(&persisted)?;
+        self.memory.prefixes = persisted.prefixes;
+        self.memory.suffixes = persisted.suffixes;
+        self.memory.insert_spaces = persisted.insert_spaces;
+        self.memory.storage_path = Some(path.clone());
+        self.memory.storage_status = format!(
+            "本地记忆已更新：{} 个前缀、{} 个后缀；添加空格为 {}，文件位于 {}。",
+            self.memory.prefixes.len(),
+            self.memory.suffixes.len(),
+            if self.memory.insert_spaces { "开启" } else { "关闭" },
+            path.display()
+        );
+        Ok(path)
     }
 
     /// 将条目集合规范化为去空白、去重且保持原始顺序的列表。
@@ -451,6 +504,7 @@ impl KeywordApp {
         prefixes: &[String],
         keywords: &[String],
         suffixes: &[String],
+        insert_spaces: bool,
     ) -> Vec<String> {
         if !Self::has_any_entries(prefixes, keywords, suffixes) {
             return Vec::new();
@@ -476,12 +530,30 @@ impl KeywordApp {
         for prefix in &prefix_values {
             for keyword in &keyword_values {
                 for suffix in &suffix_values {
-                    combinations.push(format!("{prefix}{keyword}{suffix}"));
+                    combinations.push(Self::compose_keyword(
+                        prefix,
+                        keyword,
+                        suffix,
+                        insert_spaces,
+                    ));
                 }
             }
         }
 
         combinations
+    }
+
+    /// 将单条“前缀 + 核心词 + 后缀”组合成最终关键词，可按需在非空片段间插入空格。
+    fn compose_keyword(prefix: &str, keyword: &str, suffix: &str, insert_spaces: bool) -> String {
+        if !insert_spaces {
+            return format!("{prefix}{keyword}{suffix}");
+        }
+
+        [prefix, keyword, suffix]
+            .into_iter()
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// 生成输入条目统计文案，帮助界面在按钮和摘要区域展示当前解析状态。
@@ -503,8 +575,8 @@ impl KeywordApp {
         ui: &mut Ui,
         state: &mut EditorPaneState,
         memory_entries: Option<&[String]>,
-    ) -> bool {
-        let mut reused_any = false;
+    ) -> EditorInteraction {
+        let mut interaction = EditorInteraction::None;
         Frame::group(ui.style())
             .fill(theme::SURFACE)
             .stroke(Stroke::new(1.0, theme::BORDER))
@@ -521,12 +593,20 @@ impl KeywordApp {
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.button("清空").clicked() {
-                            state.buffer.clear();
+                            if Self::should_remove_memory_on_clear(&state.buffer, memory_entries) {
+                                interaction = EditorInteraction::RemoveMemory;
+                            } else {
+                                state.buffer.clear();
+                            }
                         }
 
                         if let Some(entries) = memory_entries {
                             if !entries.is_empty() && ui.button("回填全部").clicked() {
-                                reused_any = Self::append_entries_to_buffer(&mut state.buffer, entries) > 0;
+                                interaction = if Self::append_entries_to_buffer(&mut state.buffer, entries) > 0 {
+                                    EditorInteraction::ReusedMemory
+                                } else {
+                                    EditorInteraction::None
+                                };
                             }
                         }
                     });
@@ -551,7 +631,55 @@ impl KeywordApp {
                         );
                     });
             });
-        reused_any
+        interaction
+    }
+
+    /// 判断当前“清空”点击是否应升级为删除已记忆前后缀的动作。
+    fn should_remove_memory_on_clear(buffer: &str, memory_entries: Option<&[String]>) -> bool {
+        buffer.trim().is_empty()
+            && memory_entries
+                .map(|entries| !entries.is_empty())
+                .unwrap_or(false)
+    }
+
+    /// 删除指定类型的本地记忆，并同步刷新界面反馈与存储状态。
+    fn clear_remembered_entries(&mut self, bucket: MemoryBucket) {
+        let persisted = match bucket {
+            MemoryBucket::Prefix if self.memory.prefixes.is_empty() => {
+                self.results
+                    .set_info_feedback("当前没有可删除的已记忆前缀。");
+                return;
+            }
+            MemoryBucket::Suffix if self.memory.suffixes.is_empty() => {
+                self.results
+                    .set_info_feedback("当前没有可删除的已记忆后缀。");
+                return;
+            }
+            MemoryBucket::Prefix => PersistedMemory {
+                prefixes: Vec::new(),
+                suffixes: self.memory.suffixes.clone(),
+                insert_spaces: self.actions.insert_spaces,
+            },
+            MemoryBucket::Suffix => PersistedMemory {
+                prefixes: self.memory.prefixes.clone(),
+                suffixes: Vec::new(),
+                insert_spaces: self.actions.insert_spaces,
+            },
+        };
+
+        match self.store_persisted_memory(persisted) {
+            Ok(_) => {
+                self.results.set_success_feedback(match bucket {
+                    MemoryBucket::Prefix => "已删除全部已记忆前缀；再次生成时会按新输入重新记录。".to_owned(),
+                    MemoryBucket::Suffix => "已删除全部已记忆后缀；再次生成时会按新输入重新记录。".to_owned(),
+                });
+            }
+            Err(err) => {
+                self.memory.storage_status = format!("本地记忆保存失败：{err}");
+                self.results
+                    .set_error_feedback(format!("删除本地记忆失败：{err}"));
+            }
+        }
     }
 
     /// 将单个已记忆条目追加到输入框末尾，并避免写入重复内容。
@@ -608,6 +736,22 @@ impl KeywordApp {
                 ui.label(RichText::new(&self.actions.status_message).color(theme::TEXT_MUTED));
                 ui.add_space(14.0);
 
+                let spacing_changed = ui
+                    .checkbox(
+                    &mut self.actions.insert_spaces,
+                    RichText::new("添加空格").color(theme::TEXT_PRIMARY),
+                )
+                    .changed();
+                if spacing_changed {
+                    self.persist_spacing_preference();
+                }
+                ui.label(
+                    RichText::new("勾选后，仅在相邻非空片段之间插入空格。")
+                        .size(13.0)
+                        .color(theme::TEXT_MUTED),
+                );
+                ui.add_space(12.0);
+
                 ui.horizontal_wrapped(|ui| {
                     let generate_clicked = ui
                         .add_enabled(
@@ -657,6 +801,23 @@ impl KeywordApp {
             });
     }
 
+    /// 持久化“添加空格”复选框状态，并让下次启动自动恢复当前偏好。
+    fn persist_spacing_preference(&mut self) {
+        match self.store_persisted_memory(self.snapshot_persisted_memory()) {
+            Ok(_) => {
+                self.results.set_info_feedback(format!(
+                    "已保存“添加空格”设置：{}。下次启动会自动恢复。",
+                    if self.actions.insert_spaces { "开启" } else { "关闭" }
+                ));
+            }
+            Err(err) => {
+                self.memory.storage_status = format!("本地记忆保存失败：{err}");
+                self.results
+                    .set_error_feedback(format!("保存“添加空格”设置失败：{err}"));
+            }
+        }
+    }
+
     /// 渲染结果区，并提供只读可选中的文本视图与复制反馈展示。
     fn render_results_panel(&mut self, ui: &mut Ui) {
         let state = &self.results;
@@ -695,7 +856,7 @@ impl KeywordApp {
                         .inner_margin(Margin::same(8))
                         .show(ui, |ui| {
                             let row_height = ui.text_style_height(&egui::TextStyle::Body);
-                            let fixed_height = row_height * 5.0 + 12.0;
+                            let fixed_height = row_height * 6.0 + 12.0;
 
                             ScrollArea::vertical()
                                 .auto_shrink([false, false])
@@ -798,6 +959,7 @@ impl ActionPanelState {
         Self {
             generate_enabled: false,
             copy_enabled: false,
+            insert_spaces: false,
             primary_label: "生成结果",
             secondary_label: "前缀和后缀可留空；生成成功后会自动写入本地记忆。",
             status_message: "请输入至少一个非空条目后开始生成。".to_owned(),
@@ -868,17 +1030,61 @@ mod tests {
     #[test]
     fn build_combinations_handles_missing_dimensions() {
         let only_keywords =
-            KeywordApp::build_combinations(&[], &["工具".to_owned(), "教程".to_owned()], &[]);
+            KeywordApp::build_combinations(&[], &["工具".to_owned(), "教程".to_owned()], &[], false);
         let prefix_and_suffix = KeywordApp::build_combinations(
             &["AI".to_owned()],
             &[],
             &["下载".to_owned(), "推荐".to_owned()],
+            false,
         );
-        let empty = KeywordApp::build_combinations(&[], &[], &[]);
+        let empty = KeywordApp::build_combinations(&[], &[], &[], false);
 
         assert_eq!(only_keywords, vec!["工具", "教程"]);
         assert_eq!(prefix_and_suffix, vec!["AI下载", "AI推荐"]);
         assert!(empty.is_empty());
+    }
+
+    /// 验证启用“添加空格”后，只在非空片段之间插入空格，并避免产生多余前后空格。
+    #[test]
+    fn build_combinations_inserts_spaces_only_between_non_empty_segments() {
+        let keyword_and_suffix = KeywordApp::build_combinations(
+            &[],
+            &["关键词".to_owned()],
+            &["下载".to_owned()],
+            true,
+        );
+        let full = KeywordApp::build_combinations(
+            &["免费".to_owned()],
+            &["AI工具".to_owned()],
+            &["下载".to_owned()],
+            true,
+        );
+
+        assert_eq!(keyword_and_suffix, vec!["关键词 下载"]);
+        assert_eq!(full, vec!["免费 AI工具 下载"]);
+    }
+
+    /// 验证只有在输入框已空且确实存在本地记忆时，二次点击“清空”才会触发删除记忆。
+    #[test]
+    fn should_remove_memory_on_clear_only_when_buffer_is_empty_and_memory_exists() {
+        let remembered = vec!["免费".to_owned()];
+
+        assert!(KeywordApp::should_remove_memory_on_clear("", Some(&remembered)));
+        assert!(KeywordApp::should_remove_memory_on_clear("   ", Some(&remembered)));
+        assert!(!KeywordApp::should_remove_memory_on_clear("AI", Some(&remembered)));
+        assert!(!KeywordApp::should_remove_memory_on_clear("", Some(&[])));
+        assert!(!KeywordApp::should_remove_memory_on_clear("", None));
+    }
+
+    /// 验证旧版本地记忆文件缺少“添加空格”字段时，会兼容回退为关闭状态。
+    #[test]
+    fn persisted_memory_defaults_insert_spaces_when_field_is_missing() {
+        let persisted: PersistedMemory =
+            serde_json::from_str(r#"{"prefixes":["免费"],"suffixes":["下载"]}"#).unwrap();
+
+        assert_eq!(persisted.prefixes, vec!["免费"]);
+        assert_eq!(persisted.suffixes, vec!["下载"]);
+        assert!(!persisted.insert_spaces);
     }
 
     /// 验证批量回填会保留换行结构，并避免把已存在条目重复写回输入框。
@@ -903,6 +1109,7 @@ mod tests {
             memory: RememberedEntriesState {
                 prefixes: Vec::new(),
                 suffixes: Vec::new(),
+                insert_spaces: false,
                 storage_path: None,
                 storage_status: String::new(),
             },
