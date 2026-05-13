@@ -1,5 +1,5 @@
 param(
-    [Parameter(Position = 0)]
+    [Parameter(Mandatory = $false, ValueFromRemainingArguments = $true)]
     [string[]]$CargoArgs
 )
 
