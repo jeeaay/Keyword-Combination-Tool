@@ -59,7 +59,7 @@ pub fn apply_theme(ctx: &egui::Context) {
     style.visuals.hyperlink_color = ACCENT;
     ctx.set_style(style);
 
-    apply_windows_cjk_font(ctx);
+    apply_platform_cjk_font(ctx);
 }
 
 /// 返回统一卡片圆角，方便不同面板保持同一视觉语言。
@@ -67,11 +67,11 @@ pub fn card_radius() -> CornerRadius {
     CornerRadius::same(16)
 }
 
-/// 在 Windows 环境下优先加载常见中文字体，解决中文显示为方框的问题。
-fn apply_windows_cjk_font(ctx: &egui::Context) {
+/// 按平台优先加载常见中文字体，尽量避免中文显示为方框的问题。
+fn apply_platform_cjk_font(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
-    for (name, path) in windows_cjk_font_candidates() {
+    for (name, path) in cjk_font_candidates() {
         let Ok(bytes) = fs::read(path) else {
             continue;
         };
@@ -93,8 +93,9 @@ fn apply_windows_cjk_font(ctx: &egui::Context) {
     }
 }
 
-/// 返回 Windows 常见中文字体候选路径，按推荐优先级排序。
-fn windows_cjk_font_candidates() -> [(&'static str, &'static str); 6] {
+/// 返回当前平台常见中文字体候选路径，按推荐优先级排序。
+#[cfg(target_os = "windows")]
+fn cjk_font_candidates() -> [(&'static str, &'static str); 6] {
     [
         (
             "MicrosoftYaHei",
@@ -109,4 +110,72 @@ fn windows_cjk_font_candidates() -> [(&'static str, &'static str); 6] {
         ("NSimSun", r"C:\Windows\Fonts\NSimsun.ttf"),
         ("SimSun", r"C:\Windows\Fonts\simsun.ttc"),
     ]
+}
+
+/// 返回当前平台常见中文字体候选路径，按推荐优先级排序。
+#[cfg(target_os = "macos")]
+fn cjk_font_candidates() -> [(&'static str, &'static str); 6] {
+    [
+        (
+            "PingFangSC",
+            "/System/Library/Fonts/PingFang.ttc",
+        ),
+        (
+            "HiraginoSansGB",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        ),
+        (
+            "SongtiSC",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+        ),
+        (
+            "ArialUnicodeMS",
+            "/Library/Fonts/Arial Unicode.ttf",
+        ),
+        (
+            "NotoSansCJKSC",
+            "/System/Library/Fonts/Supplemental/NotoSansCJK.ttc",
+        ),
+        (
+            "STSong",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+        ),
+    ]
+}
+
+/// 返回当前平台常见中文字体候选路径，按推荐优先级排序。
+#[cfg(target_os = "linux")]
+fn cjk_font_candidates() -> [(&'static str, &'static str); 6] {
+    [
+        (
+            "NotoSansCJKSC",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        ),
+        (
+            "NotoSansSC",
+            "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
+        ),
+        (
+            "WenQuanYiMicroHei",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        ),
+        (
+            "WenQuanYiZenHei",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        ),
+        (
+            "SourceHanSansSC",
+            "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
+        ),
+        (
+            "DroidSansFallback",
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        ),
+    ]
+}
+
+/// 其他平台暂不提供额外字体候选，回退到 egui 默认字体。
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn cjk_font_candidates() -> [(&'static str, &'static str); 0] {
+    []
 }
