@@ -148,6 +148,41 @@ powershell -ExecutionPolicy Bypass -File .\msvc-cargo.ps1 test
 - 发布给普通用户时，通常只需要分发 `keyword.exe`
 - `target\release` 下的 `deps`、`build`、`incremental`、`.pdb` 等内容主要用于构建或调试，通常不需要随程序一起打包
 
+### GitHub Actions 自动发布
+
+仓库已内置跨平台发布工作流 [release.yml](file:///h:/git/rust/keyword/.github/workflows/release.yml)，支持以下能力：
+
+- 在 `Windows`、`macOS`、`Linux` 上先执行 `cargo test --locked`
+- 构建 Windows x64 Release 压缩包
+- 构建 Linux x64 Release 压缩包
+- 构建真正的 macOS universal 二进制（`x86_64 + aarch64`）
+- 自动生成 `SHA256SUMS.txt` 校验文件
+- 在推送 `v*` tag 时自动发布到 GitHub Release
+
+使用方式：
+
+1. 手动运行：
+   - 打开 GitHub 仓库的 `Actions`
+   - 选择 `release` 工作流
+   - 点击 `Run workflow`
+2. 自动发布：
+   - 先在本地创建并推送版本标签：
+
+   ```bash
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+   - 标签推送到远端后，工作流会自动触发
+   - 工作流成功后会自动创建或更新对应的 GitHub Release
+
+默认生成的发布产物：
+
+- `keyword-windows-x64.zip`
+- `keyword-linux-x64.tar.gz`
+- `keyword-macos-universal.tar.gz`
+- `SHA256SUMS.txt`
+
 ## 常见问题
 
 ### `link.exe` 找不到
