@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  packages: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -31,6 +32,8 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: install rust
         uses: dtolnay/rust-toolchain@stable
@@ -207,27 +210,142 @@ jobs:
           name: keyword-checksums
           path: SHA256SUMS.txt
 
+  release-assets:
+    name: sign-assets
+    runs-on: ubuntu-latest
+    needs:
+      - checksums
+
+    steps:
+      - name: download checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: keyword-checksums
+          path: assets
+
+      - name: download all packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: collect signable files
+        run: |
+          mkdir -p sign-dir
+          find release-artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec cp {} sign-dir/ \;
+          cp assets/SHA256SUMS.txt sign-dir/SHA256SUMS.txt
+
+      - name: generate minisign checksums
+        uses: jmgilman/actions-generate-checksum@v1
+        with:
+          output: sign-dir/CHECKSUMS.txt
+          patterns: |
+            sign-dir/*.zip
+            sign-dir/*.tar.gz
+            sign-dir/SHA256SUMS.txt
+
+      - name: upload signed artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: keyword-signed-assets
+          path: sign-dir/*
+
   release:
     name: publish-release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     needs:
-      - checksums
+      - release-assets
 
     steps:
-      - name: download packaged artifacts
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: download signed artifacts
         uses: actions/download-artifact@v4
         with:
-          path: release-artifacts
+          name: keyword-signed-assets
+          path: publish
 
-      - name: collect release files
+      - name: generate changelog
+        id: changelog
         run: |
-          mkdir -p publish
-          find release-artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "SHA256SUMS.txt" \) -exec cp {} publish/ \;
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -E '^v' | head -2 | tail -1 || echo "")
+
+          echo "## What's Changed" >> CHANGELOG_BODY.md
+
+          if [ -n "$PREVIOUS_TAG" ]; then
+            echo "" >> CHANGELOG_BODY.md
+            echo "**Full Changelog**: ${PREVIOUS_TAG}...${TAG_NAME}" >> CHANGELOG_BODY.md
+            echo "" >> CHANGELOG_BODY.md
+
+            git log "${PREVIOUS_TAG}..${TAG_NAME}" --pretty=format:"%s" --reverse >> CHANGELOG_BODY.md
+          else
+            echo "" >> CHANGELOG_BODY.md
+            echo "This is the first release." >> CHANGELOG_BODY.md
+            echo "" >> CHANGELOG_BODY.md
+
+            git log --pretty=format:"%s" --reverse >> CHANGELOG_BODY.md
+          fi
+
+          echo "" >> CHANGELOG_BODY.md
+          echo "## Assets" >> CHANGELOG_BODY.md
+          echo "" >> CHANGELOG_BODY.md
+          echo "| File | SHA256 |" >> CHANGELOG_BODY.md
+          echo "|------|--------|" >> CHANGELOG_BODY.md
+
+          if [ -f publish/SHA256SUMS.txt ]; then
+            while IFS=' ' read -r hash filename; do
+              echo "| ${filename} | ${hash} |" >> CHANGELOG_BODY.md
+            done < publish/SHA256SUMS.txt
+          fi
+
+      - name: generate release body
+        id: release_body
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+
+          cat > RELEASE_BODY.md << 'EOF'
+          ## Keyword Composer ${TAG_NAME}
+
+          关键词组合桌面工具 - Rust + eframe/egui
+
+          EOF
+
+          cat CHANGELOG_BODY.md >> RELEASE_BODY.md
+
+          cat >> RELEASE_BODY.md << 'EOF'
+
+          ## Installation
+
+          ### Windows
+          1. 下载 `keyword-windows-x64.zip`
+          2. 解压后直接运行 `keyword.exe`
+
+          ### macOS
+          1. 下载 `keyword-macos-universal.tar.gz`
+          2. 解压后运行 `keyword`
+          3. 如果遇到 Gatekeeper 拦截，执行：`xattr -d com.apple.quarantine keyword`
+
+          ### Linux
+          1. 下载 `keyword-linux-x64.tar.gz`
+          2. 解压后运行 `keyword`
+
+          ## Verify Checksums
+
+          下载 SHA256SUMS.txt 并验证：
+
+          ```bash
+          sha256sum -c SHA256SUMS.txt
+          ```
+          EOF
 
       - name: publish github release
         uses: softprops/action-gh-release@v2
         with:
           files: publish/*
-          generate_release_notes: true
+          body_path: RELEASE_BODY.md
           draft: false
+          prerelease: false
